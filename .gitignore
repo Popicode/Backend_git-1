@@ -13,3 +13,4 @@ vgit/
 # Editor / OS #
 .vscode/settings.local.json
 *.log
+venv
