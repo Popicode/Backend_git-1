@@ -2,6 +2,10 @@
 
 Repositorio con entorno virtual listo para ejecutar Django (Python) para clases de INACAP.
 
+El flujo de vinculación del autenticador, los endpoints y los pasos de verificación
+están documentados en [Enrolamiento MFA](docs/mfa-enrollment.md).
+La bitácora de esta implementación está en [CAMBIOS.txt](CAMBIOS.txt).
+
 ---
 
 ## Tabla de Contenidos

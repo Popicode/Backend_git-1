@@ -1,0 +1,44 @@
+Cambio: backend-mfa-enrollment
+
+Fecha: 2026-10-05
+Repositorio: backend/Backend_git
+Rama de trabajo: feature/backend-mfa-enrollment
+Base: develop (b94440b2091031deaa838c5490294c399ca7cafe)
+Reglas: commits pequeños, Conventional Commits en español y autorización previa.
+La modificación preexistente de .gitignore se conserva ajena a este cambio.
+Trabajo distribuido entre dos subagentes (lógica y pruebas/documentación), con
+integración de endpoints y revisión cruzada por el agente principal.
+
+- Enrolamiento MFA al primer login por contraseña, sin JWT antes de confirmar TOTP.
+- Setup devuelve secreto, URI y SVG generado localmente por qrcode.svg, con no-store.
+- Usuarios ya confirmados completan el login mediante /api/auth/mfa/verify/.
+- Desafíos de 300 segundos, separados por propósito, consumidos al completar el flujo;
+  nuevo login invalida el anterior y cinco códigos incorrectos agotan el desafío.
+- Se rechazan códigos que no sean cadenas de seis dígitos ASCII, cuentas inactivas,
+  cuentas temporales fuera de vigencia y desafíos anteriores a un cambio de contraseña.
+- Throttle compartido de autenticación: 30 solicitudes/minuto por cliente/IP.
+- DRF_NUM_PROXIES=0 ignora X-Forwarded-For en acceso directo; configurar proxies reales
+  confiables y caché compartida al desplegar múltiples workers.
+- Login y MFA ignoran Bearer inválido/caducado; actualizaciones de serializer, admin y
+  formulario de contraseña no restauran estado MFA antiguo ni desafíos consumidos.
+- Alta y consulta de usuarios no revelan secretos ni URI; mfa_confirmed es solo lectura.
+- Migración conserva como confirmados los usuarios con secreto existente.
+- generate_mfa_secret mantiene compatibilidad y marca MFA como confirmado.
+- Retirado el acceso JWT solo con contraseña /api/api/token/; renovación conservada.
+- Administración con UserAdmin, rol y vigencia; confirmación solo lectura y sin secretos.
+- Documentación en docs/mfa-enrollment.md y especificación OpenSpec del cambio.
+- Pruebas de integración añadidas y expectativas heredadas actualizadas.
+
+Estado: implementación integrada y revisada estáticamente; ejecución NO verificada.
+El venv referencia Python 3.12 en C:\Users\escal\AppData\Local\Programs\Python\Python312\python.exe.
+La búsqueda posterior devuelve Acceso denegado en esa ruta: no se puede confirmar
+su ausencia. No se encontró otro intérprete ejecutable desde esta sesión.
+uv install de Python 3.13 falló por red OS10013. Los intentos de pip install y manage.py
+test fallaron porque el intérprete no es accesible. qrcode==8.2 declarado pero NO instalado.
+Instalación, pruebas, checks y aplicación de migraciones PENDIENTES.
+Restaurar Python o proporcionar la ruta de un intérprete; instalar requirements.txt
+con python -m pip install -r requirements.txt y ejecutar manage.py check,
+makemigrations --check --dry-run, test apiGit y migrate usando ese entorno funcional.
+Los secretos heredados no se sobrescriben: quien no recibió QR necesita recuperación
+separada. No hay correo automático, cambio obligatorio de contraseña temporal ni reset MFA.
+Integración frontend pendiente. No se realizaron commits.
