@@ -1,12 +1,24 @@
 from datetime import timedelta
+
+import qrcode
+import qrcode.image.svg
 from django.contrib.auth import authenticate
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from django.views.decorators.cache import never_cache
 from rest_framework import mixins, status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import (
+    action, api_view, authentication_classes, permission_classes, throttle_classes,
+)
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
+
 from . import selectors, services
 from .models import AuditLog, Category, Loan, ResourceItem, ResourceTitle, Sanction, Student, User
 from .permissions import IsAdminRole
@@ -14,9 +26,8 @@ from .serializers import (
     AuditLogSerializer, CatalogSerializer, CategorySerializer, LoanCreateSerializer,
     LoanReceiptSerializer, LoanSerializer, ResourceItemSerializer, ResourceTitleSerializer,
     SanctionSerializer, StudentSerializer, UserSerializer,
+    LoginSerializer, MfaChallengeSerializer, MfaCodeSerializer,
 )
-from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.exceptions import TokenError
 
 
 def get_client_ip(request):
@@ -28,17 +39,35 @@ def get_client_ip(request):
 
 # ---------- auth ----------
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def login_view(request):
-    """RF-01, step 1: checks username/password and returns a challenge for the MFA code."""
-    username = request.data.get('username')
-    password = request.data.get('password')
+class AuthRateThrottle(ScopedRateThrottle):
+    """Limit password and MFA requests from each client address."""
 
-    if not username or not password:
-        return Response(
-            {'detail': 'Debes enviar username y password'}, status=status.HTTP_400_BAD_REQUEST
-        )
+    def allow_request(self, request: Request, view: APIView) -> bool:
+        view.throttle_scope = 'auth'
+        return super().allow_request(request, view)
+
+
+def jwt_session_response(user: User, request: Request) -> Response:
+    """Issue a session only after a successful second factor."""
+    refresh = RefreshToken.for_user(user)
+    services.record_audit_event(user, 'LOGIN', 'User', user.id, get_client_ip(request))
+    return Response({
+        'refresh': str(refresh), 'access': str(refresh.access_token),
+        'user': UserSerializer(user).data,
+    })
+
+
+@never_cache
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([AuthRateThrottle])
+def login_view(request: Request) -> Response:
+    """RF-01, step 1: checks username/password and returns a challenge for the MFA code."""
+    serializer = LoginSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    username = serializer.validated_data['username']
+    password = serializer.validated_data['password']
 
     user = authenticate(username=username, password=password)
     if user is None:
@@ -46,43 +75,67 @@ def login_view(request):
 
     now = timezone.now()
     if user.is_temporary:
-        if (user.valid_until and user.valid_until < now) or \
+        if (not user.valid_until or user.valid_until <= now) or \
                 (user.valid_from and user.valid_from > now):
             return Response(
                 {'detail': 'Tu cuenta temporal no está vigente'},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-    if not user.mfa_secret:
-        return Response(
-            {'detail': 'Esta cuenta no tiene MFA configurado, contacta a un administrador'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
-
     challenge = services.create_mfa_challenge(user)
-    return Response({'mfa_challenge': challenge})
+    return Response({
+        'mfa_challenge': challenge, 'mfa_setup_required': not user.mfa_confirmed,
+    })
 
 
+@never_cache
 @api_view(['POST'])
+@authentication_classes([])
 @permission_classes([AllowAny])
-def mfa_verify_view(request):
+@throttle_classes([AuthRateThrottle])
+def mfa_verify_view(request: Request) -> Response:
     """RF-01, step 2: checks the TOTP code and issues the real JWT."""
-    challenge = request.data.get('mfa_challenge')
-    code = request.data.get('code')
-
-    if not challenge or not code:
-        return Response(
-            {'detail': 'Debes enviar mfa_challenge y code'}, status=status.HTTP_400_BAD_REQUEST
-        )
-
-    user = services.resolve_mfa_challenge(challenge)
-    if not services.verify_mfa_code(user, code):
+    serializer = MfaCodeSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    user = services.verify_mfa_challenge(
+        serializer.validated_data['mfa_challenge'], serializer.validated_data['code'],
+    )
+    if user is None:
         return Response({'detail': 'Código MFA inválido'}, status=status.HTTP_401_UNAUTHORIZED)
 
-    refresh = RefreshToken.for_user(user)
-    services.record_audit_event(user, 'LOGIN', 'User', user.id, get_client_ip(request))
-    return Response({'refresh': str(refresh),
-        'access': str(refresh.access_token), 'user': UserSerializer(user).data})
+    return jwt_session_response(user, request)
+
+
+@never_cache
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([AuthRateThrottle])
+def mfa_setup_view(request: Request) -> Response:
+    """Show enrollment material only to the password-verified account owner."""
+    serializer = MfaChallengeSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = services.start_mfa_enrollment(serializer.validated_data['mfa_challenge'])
+    qr = qrcode.make(data['mfa_provisioning_uri'], image_factory=qrcode.image.svg.SvgPathImage)
+    data['qr_code_svg'] = qr.to_string(encoding='unicode')
+    return Response(data)
+
+
+@never_cache
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([AuthRateThrottle])
+def mfa_confirm_view(request: Request) -> Response:
+    """Activate MFA and issue the first session after proof of enrollment."""
+    serializer = MfaCodeSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    user = services.confirm_mfa_enrollment(
+        serializer.validated_data['mfa_challenge'], serializer.validated_data['code'],
+    )
+    if user is None:
+        return Response({'detail': 'Invalid MFA code.'}, status=status.HTTP_401_UNAUTHORIZED)
+    return jwt_session_response(user, request)
 
 
 @api_view(['POST'])
@@ -126,11 +179,7 @@ class UserViewSet(viewsets.ModelViewSet):
             created_by=request.user,
             ip_address=get_client_ip(request),
         )
-        # one-time reveal: the admin must hand the secret/QR to the operator now
-        data = UserSerializer(user).data
-        data['mfa_secret'] = user.mfa_secret
-        data['mfa_provisioning_uri'] = services.build_mfa_provisioning_uri(user)
-        return Response(data, status=status.HTTP_201_CREATED)
+        return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
 
     def destroy(self, request, *args, **kwargs):
         # soft delete: we only deactivate the user

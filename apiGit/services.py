@@ -1,4 +1,6 @@
+import binascii
 import math
+import secrets
 from datetime import timedelta
 
 import pyotp
@@ -7,6 +9,7 @@ from django.core import signing
 from django.core.mail import send_mail
 from django.db import transaction
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare, salted_hmac
 from rest_framework import serializers, status
 from rest_framework.exceptions import APIException
 
@@ -46,7 +49,6 @@ def create_staff_user(data: dict, created_by: User = None, ip_address: str = Non
             {'valid_until': 'Una cuenta temporal necesita fecha de caducidad'}
         )
     user = User.objects.create_user(password=password, **data)
-    generate_mfa_secret(user)
     if created_by:
         record_audit_event(created_by, 'USER_CREATED', 'User', user.id, ip_address)
     return user
@@ -72,51 +74,198 @@ def expire_temporary_accounts() -> int:
 
 MFA_CHALLENGE_SALT = 'apiGit.mfa-challenge'
 MFA_CHALLENGE_MAX_AGE = 300  # 5 minutos para completar el segundo factor
+MFA_MAX_FAILED_ATTEMPTS = 5
 
 
 def generate_mfa_secret(user: User) -> str:
-    """RF-01: creates the TOTP secret used as the staff's second login factor."""
+    """Legacy helper: provision an already-confirmed secret (not for signup)."""
     secret = pyotp.random_base32()
     user.mfa_secret = secret
-    user.save(update_fields=['mfa_secret'])
+    user.mfa_confirmed = True
+    user.mfa_pending_secret = ''
+    user.mfa_challenge_nonce = ''
+    user.mfa_failed_attempts = 0
+    user.save(update_fields=[
+        'mfa_secret', 'mfa_confirmed', 'mfa_pending_secret',
+        'mfa_challenge_nonce', 'mfa_failed_attempts',
+    ])
     return secret
 
 
-def build_mfa_provisioning_uri(user: User) -> str:
-    """URI (QR) to enroll the secret in an authenticator app, shown only once."""
-    return pyotp.totp.TOTP(user.mfa_secret).provisioning_uri(
+def build_mfa_provisioning_uri(user: User, secret: str | None = None) -> str:
+    """Build an authenticator URI for an explicitly supplied or active secret."""
+    return pyotp.TOTP(user.mfa_secret if secret is None else secret).provisioning_uri(
         name=user.email, issuer_name='Biblioteca INACAP'
     )
 
 
+def _invalid_mfa_challenge() -> serializers.ValidationError:
+    return serializers.ValidationError({
+        'mfa_challenge': 'Invalid or expired challenge. Sign in again.',
+    })
+
+
+def _validate_mfa_account(user: User) -> None:
+    now = timezone.now()
+    if not user.is_active or (user.is_temporary and (
+        not user.valid_until or user.valid_until <= now
+        or (user.valid_from and user.valid_from > now)
+    )):
+        raise _invalid_mfa_challenge()
+
+
+def _mfa_password_binding(user: User) -> str:
+    # Signed tokens are readable: never include the stored password hash itself.
+    return salted_hmac(MFA_CHALLENGE_SALT, user.password).hexdigest()
+
+
+@transaction.atomic
 def create_mfa_challenge(user: User) -> str:
-    """Short-lived token issued after step 1 (password); it's not a session yet."""
-    return signing.dumps({'user_id': user.id}, salt=MFA_CHALLENGE_SALT)
+    """Issue a password-bound, five-minute challenge and invalidate prior logins."""
+    try:
+        current = User.objects.select_for_update().get(pk=user.pk)
+    except User.DoesNotExist:
+        raise _invalid_mfa_challenge() from None
+    _validate_mfa_account(current)
+    if not constant_time_compare(user.password, current.password):
+        raise _invalid_mfa_challenge()
+    current.mfa_challenge_nonce = secrets.token_hex(32)
+    current.mfa_failed_attempts = 0
+    current.mfa_pending_secret = ''
+    current.save(update_fields=[
+        'mfa_challenge_nonce', 'mfa_failed_attempts', 'mfa_pending_secret',
+    ])
+    challenge = signing.dumps({
+        'user_id': current.pk,
+        'nonce': current.mfa_challenge_nonce,
+        'password_binding': _mfa_password_binding(current),
+        'purpose': 'verify' if current.mfa_confirmed else 'setup',
+    }, salt=MFA_CHALLENGE_SALT)
+    # The login response must describe the same enrollment state as this token.
+    user.mfa_confirmed = current.mfa_confirmed
+    return challenge
 
 
 def resolve_mfa_challenge(challenge: str) -> User:
-    """Decodes the challenge from /auth/login/ and returns the pending user."""
+    """Validate a challenge without consuming it; authentication needs verification."""
+    with transaction.atomic():
+        return _resolve_mfa_challenge(challenge)
+
+
+def _resolve_mfa_challenge(challenge: str, purpose: str | None = None) -> User:
+    """Resolve and lock the current challenge inside the caller's transaction."""
+    if not isinstance(challenge, str) or not challenge:
+        raise _invalid_mfa_challenge()
     try:
         data = signing.loads(
             challenge, salt=MFA_CHALLENGE_SALT, max_age=MFA_CHALLENGE_MAX_AGE
         )
-    except signing.BadSignature:
-        raise serializers.ValidationError(
-            {'mfa_challenge': 'El challenge es inválido o expiró, inicia sesión de nuevo'}
-        )
+    except (signing.BadSignature, ValueError, TypeError):
+        raise _invalid_mfa_challenge() from None
+    if not isinstance(data, dict) or type(data.get('user_id')) is not int:
+        raise _invalid_mfa_challenge()
+    if not all(isinstance(data.get(key), str) for key in (
+        'nonce', 'password_binding', 'purpose',
+    )):
+        raise _invalid_mfa_challenge()
     try:
-        return User.objects.get(pk=data['user_id'], is_active=True)
-    except User.DoesNotExist:
-        raise serializers.ValidationError(
-            {'mfa_challenge': 'El challenge es inválido o expiró, inicia sesión de nuevo'}
-        )
+        user = User.objects.select_for_update().get(pk=data['user_id'])
+    except (User.DoesNotExist, ValueError, OverflowError):
+        raise _invalid_mfa_challenge() from None
+    _validate_mfa_account(user)
+    expected_purpose = 'verify' if user.mfa_confirmed else 'setup'
+    if (
+        data['purpose'] != expected_purpose
+        or (purpose is not None and data['purpose'] != purpose)
+        or not user.mfa_challenge_nonce
+        or not constant_time_compare(data['nonce'], user.mfa_challenge_nonce)
+        or not constant_time_compare(data['password_binding'], _mfa_password_binding(user))
+        or user.mfa_failed_attempts >= MFA_MAX_FAILED_ATTEMPTS
+    ):
+        raise _invalid_mfa_challenge()
+    return user
+
+
+@transaction.atomic
+def start_mfa_enrollment(challenge: str) -> dict[str, str]:
+    """Return the same pending secret for repeated calls with a valid setup token."""
+    user = _resolve_mfa_challenge(challenge, 'setup')
+    if not user.mfa_pending_secret:
+        user.mfa_pending_secret = pyotp.random_base32()
+        user.save(update_fields=['mfa_pending_secret'])
+    return {
+        'mfa_secret': user.mfa_pending_secret,
+        'mfa_provisioning_uri': build_mfa_provisioning_uri(user, user.mfa_pending_secret),
+    }
+
+
+def _verify_totp(secret: str, code: str) -> bool:
+    if not secret or not isinstance(code, str) or len(code) != 6:
+        return False
+    if not code.isascii() or not code.isdigit():
+        return False
+    return pyotp.TOTP(secret).verify(code, valid_window=1)
+
+
+def _complete_mfa_challenge(challenge: str, code: str, purpose: str) -> User | None:
+    """Consume success or record failure while holding the user's row lock.
+
+    Call from autocommit: an enclosing transaction can roll back attempt updates
+    if a deferred verifier error propagates through it.
+    """
+    error: ValueError | OverflowError | OSError | None = None
+    result: User | None = None
+    with transaction.atomic():
+        user = _resolve_mfa_challenge(challenge, purpose)
+        secret = user.mfa_pending_secret if purpose == 'setup' else user.mfa_secret
+        if not secret:
+            raise _invalid_mfa_challenge()
+        # Base32 decoding can fail; PyOTP's local-time conversion can also fail.
+        # Defer these errors until after saving the attempt, without swallowing
+        # programming errors or database failures. binascii.Error is a ValueError.
+        try:
+            valid = _verify_totp(secret, code)
+        except (binascii.Error, ValueError, OverflowError, OSError) as exc:
+            valid = False
+            error = exc
+        if valid:
+            if purpose == 'setup':
+                user.mfa_secret = secret
+                user.mfa_confirmed = True
+            user.mfa_pending_secret = ''
+            user.mfa_challenge_nonce = ''
+            user.mfa_failed_attempts = 0
+            user.save(update_fields=[
+                'mfa_secret', 'mfa_confirmed', 'mfa_pending_secret',
+                'mfa_challenge_nonce', 'mfa_failed_attempts',
+            ])
+            result = user
+        else:
+            user.mfa_failed_attempts += 1
+            if user.mfa_failed_attempts >= MFA_MAX_FAILED_ATTEMPTS:
+                user.mfa_challenge_nonce = ''
+                user.mfa_pending_secret = ''
+            user.save(update_fields=[
+                'mfa_failed_attempts', 'mfa_challenge_nonce', 'mfa_pending_secret',
+            ])
+    if error is not None:
+        raise error
+    return result
+
+
+def confirm_mfa_enrollment(challenge: str, code: str) -> User | None:
+    """Activate the pending secret on a correct TOTP and consume the setup token."""
+    return _complete_mfa_challenge(challenge, code, 'setup')
+
+
+def verify_mfa_challenge(challenge: str, code: str) -> User | None:
+    """Verify an enrolled user's TOTP and consume the login token exactly once."""
+    return _complete_mfa_challenge(challenge, code, 'verify')
 
 
 def verify_mfa_code(user: User, code: str) -> bool:
     """RF-01: checks the 6-digit TOTP code, tolerating one 30s window of drift."""
-    if not user.mfa_secret:
-        return False
-    return pyotp.TOTP(user.mfa_secret).verify(code, valid_window=1)
+    return user.mfa_confirmed and _verify_totp(user.mfa_secret, code)
 
 
 # ---------- students ----------

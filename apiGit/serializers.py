@@ -6,6 +6,30 @@ from .models import (
 from .validations import validate_rut, validate_staff_email, validate_student_email
 
 
+class LoginSerializer(serializers.Serializer):
+    """Validate credentials without trimming the password."""
+
+    username = serializers.CharField(max_length=150)
+    password = serializers.CharField(trim_whitespace=False, write_only=True)
+
+
+class MfaChallengeSerializer(serializers.Serializer):
+    """A short-lived credential limited to one MFA operation."""
+
+    mfa_challenge = serializers.CharField(max_length=2048)
+
+
+class MfaCodeSerializer(MfaChallengeSerializer):
+    """Require six ASCII digits, preserving leading zeros."""
+
+    code = serializers.RegexField(r'\A[0-9]{6}\Z', trim_whitespace=False)
+
+    def validate_code(self, value: str) -> str:
+        if not isinstance(self.initial_data.get('code'), str):
+            raise serializers.ValidationError('The code must be a six-digit string.')
+        return value
+
+
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -20,12 +44,14 @@ class UserSerializer(serializers.ModelSerializer):
             'valid_from',
             'valid_until',
             'is_active',
+            'mfa_confirmed',
             'password',
         ]
         # password is never returned in the response
         extra_kwargs = {
             'password': {'write_only': True, 'required': False},
             'is_active': {'read_only': True},
+            'mfa_confirmed': {'read_only': True},
         }
 
     def validate_email(self, value):
@@ -56,11 +82,15 @@ class UserSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         password = validated_data.pop('password', None)
-        user = super().update(instance, validated_data)
+        updated_fields = list(validated_data)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
         if password:
-            user.set_password(password)  # hash the password, never save it as plain text
-            user.save(update_fields=['password'])
-        return user
+            instance.set_password(password)
+            updated_fields.append('password')
+        # Never overwrite a concurrently consumed MFA challenge from a stale instance.
+        instance.save(update_fields=updated_fields)
+        return instance
 
 
 class StudentSerializer(serializers.ModelSerializer):

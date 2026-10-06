@@ -54,6 +54,9 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_RATES': {'auth': '30/min'},
+    # Direct local access must not trust a client-supplied X-Forwarded-For header.
+    'NUM_PROXIES': config('DRF_NUM_PROXIES', default=0, cast=int),
 }
 
 

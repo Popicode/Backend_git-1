@@ -1,13 +1,12 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
     TokenRefreshView,
 )
 from .views import (
     AuditLogViewSet, CategoryViewSet, LoanViewSet, ResourceItemViewSet, ResourceTitleViewSet,
     SanctionViewSet, StudentViewSet, UserViewSet, inventory_report_view, login_view,
-    logout_view, mfa_verify_view, shift_summary_view,
+    logout_view, mfa_verify_view, mfa_setup_view, mfa_confirm_view, shift_summary_view,
 )
 
 app_name = 'apiGit'
@@ -25,10 +24,11 @@ router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 urlpatterns = [
     path('auth/login/', login_view, name='login'),
     path('auth/mfa/verify/', mfa_verify_view, name='mfa-verify'),
+    path('auth/mfa/setup/', mfa_setup_view, name='mfa-setup'),
+    path('auth/mfa/confirm/', mfa_confirm_view, name='mfa-confirm'),
     path('auth/logout/', logout_view, name='logout'),
     path('reports/inventory/', inventory_report_view, name='inventory-report'),
     path('reports/shift-summary/', shift_summary_view, name='shift-summary'),
-    path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh')
 ]
 

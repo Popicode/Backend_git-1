@@ -4,6 +4,7 @@ djangorestframework==3.18.1
 djangorestframework_simplejwt==5.5.1
 PyJWT==2.15.1
 pyotp==2.9.0
+qrcode==8.2
 python-decouple==3.8
 sqlparse==0.6.0
 tzdata==2026.3

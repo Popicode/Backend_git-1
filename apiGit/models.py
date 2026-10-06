@@ -14,6 +14,10 @@ class User(AbstractUser):
     valid_from = models.DateTimeField(null=True, blank=True)
     valid_until = models.DateTimeField(null=True, blank=True)   # auto-expiry
     mfa_secret = models.CharField(max_length=64, blank=True)    # TOTP
+    mfa_confirmed = models.BooleanField(default=False)
+    mfa_pending_secret = models.CharField(max_length=64, blank=True, default='')
+    mfa_challenge_nonce = models.CharField(max_length=64, blank=True, default='')
+    mfa_failed_attempts = models.PositiveSmallIntegerField(default=0)
     # is_active (heredado) = soft delete. NUNCA borrado físico.
     def __str__(self):
         return f"{self.username} ({self.get_full_name()})"
