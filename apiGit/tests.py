@@ -2,6 +2,7 @@ from datetime import timedelta
 
 import pyotp
 from django.core import mail
+from django.core.cache import cache
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -12,6 +13,8 @@ from .models import Category, Loan, ResourceItem, ResourceTitle, Sanction, Stude
 
 class LoanFlowTests(TestCase):
     def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
         self.admin = User.objects.create_user(
             username='admin', email='admin@inacap.cl', password='clave12345', role='ADMIN'
         )
@@ -57,12 +60,19 @@ class LoanFlowTests(TestCase):
         response = client.post('/api/auth/login/', {
             'username': 'operador', 'password': 'clave12345',
         }, format='json')
+        totp = pyotp.TOTP(self.operator.mfa_secret)
+        valid_codes = {
+            totp.at(timezone.now() + timedelta(seconds=offset))
+            for offset in (-30, 0, 30)
+        }
+        wrong_code = next(f'{number:06d}' for number in range(10)
+                          if f'{number:06d}' not in valid_codes)
         response = client.post('/api/auth/mfa/verify/', {
-            'mfa_challenge': response.data['mfa_challenge'], 'code': '000000',
+            'mfa_challenge': response.data['mfa_challenge'], 'code': wrong_code,
         }, format='json')
         self.assertEqual(response.status_code, 401)
 
-    def test_login_without_mfa_configured_is_rejected(self):
+    def test_login_without_mfa_configured_requires_enrollment(self):
         User.objects.create_user(
             username='sinmfa', email='sinmfa@inacap.cl', password='clave12345'
         )
@@ -70,7 +80,11 @@ class LoanFlowTests(TestCase):
         response = client.post('/api/auth/login/', {
             'username': 'sinmfa', 'password': 'clave12345',
         }, format='json')
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['mfa_setup_required'])
+        self.assertIn('mfa_challenge', response.data)
+        self.assertNotIn('access', response.data)
+        self.assertNotIn('refresh', response.data)
 
     def test_endpoints_need_login(self):
         response = APIClient().get('/api/loans/')
@@ -135,11 +149,12 @@ class LoanFlowTests(TestCase):
         }, format='json')
         self.assertEqual(response.status_code, 201)
         self.assertNotIn('password', response.data)
-        self.assertIn('mfa_secret', response.data)
-        self.assertIn('mfa_provisioning_uri', response.data)
+        self.assertNotIn('mfa_secret', response.data)
+        self.assertNotIn('mfa_provisioning_uri', response.data)
+        self.assertFalse(response.data['mfa_confirmed'])
         user = User.objects.get(username='nuevo')
         self.assertTrue(user.check_password('otraclave123'))
-        self.assertEqual(user.mfa_secret, response.data['mfa_secret'])
+        self.assertFalse(user.mfa_confirmed)
 
         response = self.client.delete(f'/api/users/{user.id}/')
         self.assertEqual(response.status_code, 204)
